@@ -3,8 +3,6 @@ const CLIENT_ID = "PASTE_YOUR_CLIENT_ID";
 const CLIENT_SECRET = "PASTE_YOUR_CLIENT_SECRET";
 const REFRESH_TOKEN = "PASTE_YOUR_REFRESH_TOKEN";
 const STEP_GOAL = 10000;
-const CARDIO_GOAL = 150; // weekly Active Zone Minutes goal (Fitbit default) — the API doesn't expose your own setting
-const WEEK_STARTS_MONDAY = true;
 const DEBUG = false; // set true and re-run (not as a widget) to see raw API responses again if something looks wrong
 let debugLog = [];
 const SCRIPT_NAME = "Fitbit Air"; // must exactly match this script's name inside Scriptable
@@ -20,7 +18,7 @@ const THEME = {
   battery: { a: new Color("#30D158"), b: new Color("#7BF0A8"), icon: new Color("#30D158") },
   steps:   { a: new Color("#0A84FF"), b: new Color("#7AD6FF"), icon: new Color("#0A84FF") },
   gold:    { a: new Color("#FFB300"), b: new Color("#FFE873"), icon: new Color("#FFD60A") },
-  cardio:  { a: new Color("#FF2D55"), b: new Color("#FF8FA8"), icon: new Color("#FF375F") },
+  heart:   { a: new Color("#A50E14"), b: new Color("#FF375F"), icon: new Color("#FF375F") },
 };
 const TRACK_ALPHA = 0.30; // brighter background ring
 
@@ -92,37 +90,15 @@ async function getSteps(token) {
   return { total };
 }
 
-function startOfWeek(ref) {
-  const d = new Date(ref);
-  d.setHours(0, 0, 0, 0);
-  const back = WEEK_STARTS_MONDAY ? (d.getDay() + 6) % 7 : d.getDay();
-  d.setDate(d.getDate() - back);
-  return d;
-}
-
-async function getCardio(token) {
-  // Confirmed field shape: dataPoints[].activeZoneMinutes.activeZoneMinutes (string). Cardio/Peak
-  // minutes already arrive as "2", so a plain sum matches the Fitbit app's weekly AZM total.
-  // Results are newest-first; stop paging once we're past the start of this week.
-  const weekStart = startOfWeek(new Date());
-  const base = "https://health.googleapis.com/v4/users/me/dataTypes/active-zone-minutes/dataPoints?pageSize=1000";
-  let total = 0, pageToken = null;
-  for (let page = 0; page < 5; page++) {
-    const res = await apiGet(base + (pageToken ? "&pageToken=" + encodeURIComponent(pageToken) : ""), token);
-    const points = res.dataPoints || [];
-    let reachedOlder = false;
-    for (const p of points) {
-      const start = p?.activeZoneMinutes?.interval?.startTime;
-      if (!start) continue;
-      if (new Date(start) < weekStart) { reachedOlder = true; continue; }
-      if (p?.dataSource?.platform !== "FITBIT") continue;
-      const n = Number(p?.activeZoneMinutes?.activeZoneMinutes);
-      if (!isNaN(n)) total += n;
-    }
-    pageToken = res.nextPageToken;
-    if (reachedOlder || !pageToken) break;
-  }
-  return { total };
+async function getHeartRate(token) {
+  // Confirmed field shape: dataPoints[].heartRate.beatsPerMinute (string). The API returns
+  // newest-first, so the latest reading is points[0], not the last item.
+  const url = "https://health.googleapis.com/v4/users/me/dataTypes/heart-rate/dataPoints?pageSize=15";
+  const res = await apiGet(url, token);
+  const points = res.dataPoints || [];
+  const latest = points.find(p => p?.dataSource?.platform === "FITBIT") || points[0];
+  const bpm = latest?.heartRate?.beatsPerMinute;
+  return { bpm: !isNaN(Number(bpm)) ? Math.round(Number(bpm)) : null };
 }
 
 // ================= COLOR MATH =================
@@ -212,6 +188,67 @@ function makeRingImage(percent, theme, overflowTheme, valueText, size) {
   return ctx.getImage();
 }
 
+// ================= HEART (Bézier, shaped after SF Symbol heart.fill) =================
+// Built in a 100x100 design space, then scaled: plump round lobes, wide body,
+// softly rounded bottom point — not the sharp parametric cardioid.
+function heartPath(ctx, cx, cy, s) {
+  const P = (x, y) => new Point(cx + (x - 50) * s, cy + (y - 50) * s);
+  const path = new Path();
+  path.move(P(50, 88));
+  path.addCurve(P(6, 38), P(30, 72), P(6, 58));   // left side sweeping up
+  path.addCurve(P(50, 26), P(6, 11), P(36, 7));   // left lobe over the top into the cleft
+  path.addCurve(P(94, 38), P(64, 7), P(94, 11));  // right lobe
+  path.addCurve(P(50, 88), P(94, 58), P(70, 72)); // right side down to the point
+  path.closeSubpath();
+  ctx.addPath(path);
+}
+
+function makeHeartImage(bpm, theme, size) {
+  const ctx = new DrawContext();
+  ctx.size = new Size(size, size);
+  ctx.opaque = false;
+  ctx.respectScreenScale = true;
+
+  const s = size / 108;
+  const cx = size / 2, cy = size / 2 + size * 0.02;
+
+  // soft outer glow (cheap blur: oversized low-alpha copies)
+  for (let i = 3; i >= 1; i--) {
+    heartPath(ctx, cx, cy, s * (1 + i * 0.05));
+    ctx.setFillColor(withAlpha(theme.b, 0.06));
+    ctx.fillPath();
+  }
+  // deep blood-red base
+  heartPath(ctx, cx, cy, s);
+  ctx.setFillColor(theme.a);
+  ctx.fillPath();
+  // vivid highlight, inset and lifted, for Apple-style depth
+  heartPath(ctx, cx, cy - size * 0.045, s * 0.82);
+  ctx.setFillColor(withAlpha(theme.b, 0.62));
+  ctx.fillPath();
+
+  ctx.setTextAlignedCenter();
+  ctx.setFont(uiFont(size * 0.25, true));
+  ctx.setTextColor(Color.white());
+  ctx.drawTextInRect(bpm != null ? String(bpm) : "—", new Rect(0, cy - size * 0.16, size, size * 0.23));
+
+  // subtle pulse line beneath the number
+  const pulse = new Path();
+  const py = cy + size * 0.10, w = size * 0.34, x0 = cx - w / 2;
+  pulse.move(new Point(x0, py));
+  pulse.addLine(new Point(x0 + w * 0.30, py));
+  pulse.addLine(new Point(x0 + w * 0.42, py - size * 0.055));
+  pulse.addLine(new Point(x0 + w * 0.54, py + size * 0.07));
+  pulse.addLine(new Point(x0 + w * 0.66, py));
+  pulse.addLine(new Point(x0 + w, py));
+  ctx.addPath(pulse);
+  ctx.setStrokeColor(withAlpha(Color.white(), 0.7));
+  ctx.setLineWidth(1.4);
+  ctx.strokePath();
+
+  return ctx.getImage();
+}
+
 // ================= CARD LAYOUT =================
 function addCard(row, { symbolName, label, iconColor, image, subtitle }) {
   const card = row.addStack();
@@ -261,14 +298,14 @@ async function build() {
 
   try {
     const token = await getAccessToken();
-    const [battery, steps, cardio] = await Promise.all([getBattery(token), getSteps(token), getCardio(token)]);
+    const [battery, steps, hr] = await Promise.all([getBattery(token), getSteps(token), getHeartRate(token)]);
 
     if (DEBUG && !config.runsInWidget) {
       const debugText = debugLog.join("\n\n===============\n\n");
       Pasteboard.copyString(debugText);
       const a = new Alert();
       a.title = "Debug data copied";
-      a.message = "The raw API responses are on your clipboard now. Paste them into Notes (or straight back into our chat) and send them over.";
+      a.message = "The raw steps/heart-rate API responses are on your clipboard now. Paste them into Notes (or straight back into our chat) and send them over.";
       a.addAction("OK");
       await a.presentAlert();
       Script.complete();
@@ -307,15 +344,12 @@ async function build() {
 
     row.addSpacer(8);
 
-    const beatCardio = cardio.total >= CARDIO_GOAL;
     addCard(row, {
-      symbolName: beatCardio ? "star.fill" : "heart.fill",
-      label: "CARDIO",
-      iconColor: beatCardio ? THEME.gold.icon : THEME.cardio.icon,
-      image: makeRingImage(cardio.total / CARDIO_GOAL, THEME.cardio, THEME.gold, String(cardio.total), 78),
-      subtitle: beatCardio
-        ? `+${cardio.total - CARDIO_GOAL} over weekly goal`
-        : `Goal ${CARDIO_GOAL} / week`,
+      symbolName: "heart.fill",
+      label: "HEART RATE",
+      iconColor: THEME.heart.icon,
+      image: makeHeartImage(hr.bpm, THEME.heart, 78),
+      subtitle: "bpm",
     });
 
     w.addSpacer(6);
